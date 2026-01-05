@@ -1,0 +1,653 @@
+---
+title: "04_clpn_sem"
+author: "Sglatt"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+if (!require("bootnet")) {
+  install.packages("bootnet")
+  require("bootnet")
+}
+if (!require("dplyr")) {
+  install.packages("dplyr")
+  require("dplyr")
+}
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+  require("ggplot2")
+}
+if (!require("glmnet")) {
+  install.packages("glmnet")
+  require("glmnet")
+}
+if (!require("lavaan")) {
+  install.packages("lavaan")
+  require("lavaan")
+}
+if (!require("psychTools")) {
+  install.packages("psychTools")
+  require("psychTools")
+}
+if (!require("qgraph")) {
+  install.packages("qgraph")
+  require("qgraph")
+}
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+  require("tidyverse")
+}
+```
+
+# Functions
+From Wysocki, A., McCarthy, I., van Bork, R., & Cramer, A. O. (2025). Cross-lagged panel networks. *advances. in/psychology,* 2, e739621.
+```{r functions}
+# getAdjMatList()
+getAdjMatList <- function(designMat, data) {
+  AdjMatList <- NULL
+  lambdaList <- NULL
+  k <- nrow(designMat)
+
+  for (t in 1:(ncol(designMat) - 1)) {
+    predictors <- as.matrix(data[, designMat[, t]])
+
+    adjMat <- matrix(0, k, k)
+    colnames(adjMat) <- designMat[, (t + 1)]
+    rownames(adjMat) <- colnames(predictors)
+
+    lambdaVec <- rep(0, k)
+
+    for (i in 1:k) {
+      set.seed(100)
+      lassoreg <- cv.glmnet(
+        x = predictors,
+        y = data[, designMat[i, t + 1]],
+        family = "gaussian", alpha = 1, standardize = TRUE
+      )
+
+      lambdaVec[i] <- lassoreg$lambda.min
+
+      adjMat[1:k, i] <- coef(lassoreg, s = lambdaVec[i], exact = FALSE)[2:(k + 1)]
+    }
+
+    AdjMatList[[t]] <- adjMat
+    lambdaList[[t]] <- lambdaVec
+  }
+  return(list(B = AdjMatList, lambdas = lambdaList))
+}
+
+# getLavaanSyntax()
+getLavaanSyntax <- function(designMat, model = NULL) {
+  k <- nrow(designMat)
+
+  regressions <- ""
+  resVariances <- ""
+
+  for (t in 1:(ncol(designMat) - 1)) {
+    for (i in 1:k) {
+      predictors <- designMat[, t]
+
+      if (!is.null(model)) {
+        predictors <- predictors[which(model[[t]][, i] != 0)]
+      }
+
+      regressions <- paste(
+        regressions, paste(designMat[i, (t + 1)], "~", sep = ""),
+        paste(predictors, collapse = "+"), "\n"
+      )
+
+      resVariances <- paste(
+        resVariances,
+        paste(designMat[i, (t + 1)], "~~", paste(designMat[(i:k), (t + 1)], collapse = "+"), sep = ""), "\n"
+      )
+    }
+  }
+
+
+  return(c(regressions, resVariances))
+}
+
+# CreateSigB()
+CreateSigB <- function(B, nonSigParam) {
+  sigB <- B
+
+  if (nrow(nonSigParam) == 0) {
+    return(B)
+  } else {
+    for (i in 1:nrow(nonSigParam)) {
+      sigB[nonSigParam$rhs[i], nonSigParam$lhs[i]] <- 0
+    }
+
+    return(sigB)
+  }
+}
+
+# CreateSeparateB()
+CreateSeparateB <- function(B, designMat) {
+  BList <- NULL
+
+  for (t in 1:(ncol(designMat) - 1)) {
+    k <- nrow(designMat)
+
+    outcomes <- designMat[, (t + 1)]
+
+    predictors <- designMat[, t]
+
+    BList[[t]] <- B[predictors, outcomes]
+  }
+
+  return(BList)
+}
+
+# InOutPredict()
+InOutPredict <- function(data, B, designMat, groups) {
+  k <- nrow(designMat)
+  predictionDf <- NULL
+
+  for (t in 1:(ncol(designMat) - 1)) {
+    inpred0 <- rep(0, k)
+    inpred1 <- rep(0, k)
+    inpred2 <- rep(0, k)
+    inpred3 <- rep(0, k)
+
+    for (i in 1:k) {
+      name.i <- designMat[i, (t + 1)]
+      group.i <- groups[i]
+
+      include.mod0 <- designMat[, t]
+      include.mod1 <- designMat[, t][-i]
+      include.mod2 <- designMat[, t][groups != group.i]
+      include.mod3 <- designMat[, t][groups == group.i]
+
+      betas.mod0 <- B[name.i, include.mod0]
+      betas.mod1 <- B[name.i, include.mod1]
+      betas.mod2 <- B[name.i, include.mod2]
+      betas.mod3 <- B[name.i, include.mod3]
+
+      denom <- var(data[, name.i], na.rm = TRUE)
+      num0 <- var(as.matrix(data[, include.mod0]) %*% betas.mod0, na.rm = T)
+      num1 <- var(as.matrix(data[, include.mod1]) %*% betas.mod1, na.rm = T)
+      num2 <- var(as.matrix(data[, include.mod2]) %*% betas.mod2, na.rm = T)
+      num3 <- var(as.matrix(data[, include.mod3]) %*% betas.mod3, na.rm = T)
+
+      inpred0[i] <- num0 / denom
+      inpred1[i] <- num1 / denom
+      inpred2[i] <- num2 / denom
+      inpred3[i] <- num3 / denom
+    }
+
+    outpred0 <- rep(0, k)
+    outpred1 <- rep(0, k)
+    outpred2 <- rep(0, k)
+    outpred3 <- rep(0, k)
+
+    for (i in 1:k) {
+      name.i <- designMat[i, t]
+      group.i <- groups[i]
+
+      include.mod0 <- designMat[, (t + 1)]
+      include.mod1 <- designMat[, (t + 1)][-i]
+      include.mod2 <- designMat[, (t + 1)][groups != group.i]
+      include.mod3 <- designMat[, (t + 1)][groups == group.i]
+
+      betas.mod0 <- B[include.mod0, name.i]
+      betas.mod1 <- B[include.mod1, name.i]
+      betas.mod2 <- B[include.mod2, name.i]
+      betas.mod3 <- B[include.mod3, name.i]
+
+      yvars.mod0 <- apply(as.data.frame(data[, include.mod0]), 2, var, na.rm = TRUE)
+      yvars.mod1 <- apply(as.data.frame(data[, include.mod1]), 2, var, na.rm = TRUE)
+      yvars.mod2 <- apply(as.data.frame(data[, include.mod2]), 2, var, na.rm = TRUE)
+      yvars.mod3 <- apply(as.data.frame(data[, include.mod3]), 2, var, na.rm = TRUE)
+
+      xvar <- var(data[, name.i], na.rm = TRUE)
+
+      rsq.mod0 <- (betas.mod0^2 * xvar) / yvars.mod0
+      rsq.mod1 <- (betas.mod1^2 * xvar) / yvars.mod1
+      rsq.mod2 <- (betas.mod2^2 * xvar) / yvars.mod2
+      rsq.mod3 <- (betas.mod3^2 * xvar) / yvars.mod3
+
+      outpred0[i] <- mean(rsq.mod0)
+      outpred1[i] <- mean(rsq.mod1)
+      outpred2[i] <- mean(rsq.mod2)
+      outpred3[i] <- mean(rsq.mod3)
+    }
+
+    predictionDf <- rbind(
+      predictionDf,
+      data.frame(
+        t = t,
+        PredictionIndex = rep(c(
+          "InPred", "CrossLagInPred", "OtherConstructInPred", "SameConstructInPred",
+          "OutPred", "CrossLagOutPred", "OtherConstructOutPred", "SameConstructOutPred"
+        ), each = k),
+        PredictionValue = c(
+          inpred0, inpred1, inpred2, inpred3,
+          outpred0, outpred1, outpred2, outpred3
+        ),
+        Variable = c(rep(designMat[, (t + 1)], times = 4), rep(designMat[, t], times = 4))
+      )
+    )
+  }
+
+  return(predictionDf)
+}
+
+# bootstrapPredictionMetrics()
+bootstrapPredictionMetrics <- function(model, designMat, groups, samples = 10,
+                                       parallel = "no") {
+  bootRes <- bootstrapLavaan(model,
+    R = samples,
+    FUN = function(x) {
+      require(lavaan)
+      as.vector(lavInspect(x, what = "est")$beta)
+    },
+    keep.idx = TRUE, parallel = parallel
+  )
+
+  BMatrices <- vector(mode = "list", length = nrow(bootRes))
+  p <- nrow(inspect(model, "sampstat")$cov)
+
+  for (i in 1:nrow(bootRes)) {
+    bootB <- matrix(bootRes[i, ],
+      nrow = p, ncol = p
+    )
+
+    colnames(bootB) <- colnames(lavInspect(model, what = "est")$beta)
+    rownames(bootB) <- rownames(lavInspect(model, what = "est")$beta)
+
+    BMatrices[[i]] <- bootB
+  }
+
+  k <- nrow(designMat)
+  predictionDf <- NULL
+
+  for (b in 1:samples) {
+    bootRows <- attr(bootRes, "boot.idx")[[1]][b, ]
+    bootData <- lavInspect(model, what = "data")[bootRows, ]
+
+    bootB <- BMatrices[[b]]
+
+    predictionDf <- rbind(
+      predictionDf,
+      cbind(b = b, InOutPredict(data = bootData, B = bootB, designMat = designMat, groups = groups))
+    )
+  }
+
+  return(predictionDf)
+}
+```
+
+# Folder for output  
+```{r output}
+if (!dir.exists("04_output")) {
+  dir.create("04_output")
+}
+```
+
+# Import data 
+```{r Data}
+RESST_3w <- readxl::read_xlsx("Raw_data/RESST_3_wave_data.xlsx")
+
+# Filter to those with data at time one and time two
+RESST_3w_all <- RESST_3w %>% filter(TP1_to_2 == 1)
+
+CLPN_all_resst <- RESST_3w_all %>%
+  dplyr::select(
+    dplyr::all_of(paste0("TP1_RESST_", 1:21)),
+    dplyr::all_of(paste0("TP2_RESST_", 1:21))
+  )
+
+colnames(CLPN_all_resst)
+```
+
+# Prepare the matrix
+```{r design matrix}
+# Matrix
+designMat <- matrix(
+  c(
+    paste0("TP1_RESST_", 1:21),
+    paste0("TP2_RESST_", 1:21)
+  ),
+  nrow = 21,
+  ncol = 2,
+  byrow = FALSE
+)
+rownames(designMat) <- paste0("R", 1:21)
+
+# Corresponding data
+CLPN_all_resst_df <- CLPN_all_resst %>%
+  dplyr::select(all_of(c(
+    paste0("TP1_RESST_", 1:21),
+    paste0("TP2_RESST_", 1:21)
+  ))) %>%
+  mutate(across(everything(), as.numeric))
+
+CLPN_all_resst_df <- as.data.frame(CLPN_all_resst)
+```
+
+# Initial LASSO model
+getAdjMatList() uses glm regression to get a beta matrix for the data via cv.glmnet for regularized regressions on  nodes at time t on nodes at (t-1)
+```{r lasso model}
+glmModel <- getAdjMatList(
+  designMat = designMat,
+  data = CLPN_all_resst_df
+)
+```
+
+# Convert LASSO model to SEM
+getLavaanSyntax() takes the model selected by the glm (above) and writes the corresponding lavaan syntax 
+```{r sem model}
+hybridlavaanSyntax <- getLavaanSyntax(
+  designMat = designMat,
+  model = glmModel$B
+)
+```
+
+# Fit the SEM/non-regularized CLPN
+Estimate all paths freely for LASSO-selected edges
+```{r fit CLPN}
+# SEM
+hybridModel <- sem(
+  model = hybridlavaanSyntax,
+  data = CLPN_all_resst,
+  fixed.x = FALSE,
+  missing = "FIML"
+)
+
+# Look at the regression parameters
+allRegressions <- parameterestimates(hybridModel,
+  standardized = TRUE
+)[grep("~~", parameterestimates(hybridModel)$op,
+  invert = TRUE
+), ]
+
+# Extract standardized & unstandardized coefficients
+hybridBStan <- t(inspect(hybridModel, "std.all")$beta) # Stand.
+hybridBUnstan <- t(inspect(hybridModel, "est")$beta) # unstand.
+
+# Look at fit statistics
+fitStats <- fitMeasures(hybridModel)
+fitStats
+```
+
+# Prune based on significance
+CreateSigB() extracts the significant paths via pruning from the SEM model
+```{r prune}
+# Get parameter estimates with p-values
+allRegressions <- parameterestimates(hybridModel, standardized = TRUE)
+allRegressions <- allRegressions[allRegressions$op != "~1", ]
+
+# Only regression paths
+regressions <- allRegressions[allRegressions$op == "~", ]
+
+# Only non-significant paths
+nonSigPaths <- regressions[regressions$pvalue > 0.05, ]
+
+# Prune non-significant paths
+hybridSigBStan <- CreateSigB(hybridBStan,
+  nonSigParam = nonSigPaths
+)
+```
+
+# In/out prediction
+InOutPredict() evaluates how variables are predicted by (in-prediction) and predict others (out-prediction)
+```{r in out predict}
+# Clusters
+groups <- c(
+  rep("self-worth", 7),
+  rep("life-worth", 4),
+  rep("social-worth", 6),
+  rep("self-understanding", 4)
+)
+
+# Prediction estimates
+predictionEstimates <- InOutPredict(
+  data = CLPN_all_resst_df,
+  B = hybridBUnstan, # unstandardized beta matrix from SEM (above)
+  designMat = designMat,
+  groups = groups
+)
+```
+
+# Visualize the CLPN-SEM pruned model
+```{r visualize}
+hybridBList <- CreateSeparateB(
+  hybridSigBStan,
+  designMat
+)
+
+# Change the node labels in the matrix
+node_labels <- paste0("R", 1:21)
+
+for (t in seq_along(hybridBList)) {
+  rownames(hybridBList[[t]]) <- node_labels
+  colnames(hybridBList[[t]]) <- node_labels
+}
+
+# Now include each item for the legend
+nodenames <- c(
+  "I like myself",
+  "I can accept myself even when others don’t accept me",
+  "I am confident that I can handle challenges that come up in life",
+  "I trust myself",
+  "I have learned how to think about myself in a more positive way",
+  "I am proud of who I am becoming",
+  "While it is sometimes difficult, I am usually able to forgive myself",
+  "There are things in my life which give me meaning and/or purpose",
+  "I have something or someone worth living for",
+  "I am willing to live – at least for now",
+  "My life is worth living, even with its ups and downs",
+  "People in my life care about how I’m feeling",
+  "I feel safe in my relationships",
+  "I feel connected with friends and/or loved ones",
+  "There are people in my life who accept me for who I am",
+  "I feel valued by people in my life",
+  "I have relationships that are mutually respectful",
+  "I understand my own personal strengths and challenges",
+  "I am able to understand the thoughts that I have about myself",
+  "I have a good sense of what I am like as a person",
+  "I know how my current challenges fit into my life history"
+)
+
+# CLPN network (unclustered) figure - pruned
+clpn_hybrid <- qgraph(hybridBList[[1]],
+  legend = TRUE,
+  nodeNames = nodenames,
+  palette = "colorblind",
+  layout = "spring",
+  posCol = "blue",
+  legend.cex = .7,
+  vsize = 7
+)
+
+# CLPN network (clustered) figure - pruned
+clpn_hybrid_cluster  <- qgraph(hybridBList[[1]],
+  legend = TRUE,
+  nodeNames = nodenames,
+  groups = groups,
+  color = c("#99FFFF", "#CC99FF", "#FFCC99", "#FF99CC"),
+  palette = "colorblind",
+  layout = "spring",
+  legend.cex = .7,
+  vsize = 6
+)
+
+# Save figures
+# Network plot
+png(
+  paste0("04_output/CLPN_network_", format(Sys.Date(), "%Y-%m-%d"), ".png"),
+  width = 8, height = 8, units = "in", res = 300
+)
+qgraph(
+  hybridBList[[1]],
+  nodeNames  = nodenames,
+  palette  = "colorblind",
+  layout = "spring",
+  vsize  = 5,
+  label.cex  = 0.7,
+  label.scale = TRUE,   
+  legend = FALSE
+)
+dev.off()
+
+# Network plot with clusters
+png(
+  paste0("04_output/CLPN_network_clusters_", format(Sys.Date(), "%Y-%m-%d"), ".png"),
+  width = 8, height = 8, units = "in", res = 300
+)
+qgraph(
+  hybridBList[[1]],
+  nodeNames = nodenames,
+  groups = groups,
+  color = c("#99FFFF", "#CC99FF", "#FFCC99", "#FF99CC"),
+  palette  = "colorblind",
+  layout = "spring",
+  vsize  = 5,
+  label.cex  = 0.7,
+  label.scale = TRUE,   
+  legend = FALSE
+)
+dev.off()
+```
+
+# Save models, etc
+```{r save}
+hybridModelList <- list(
+  hybridBMatrixStandardized = hybridBStan,
+  hybridBMatrixUnstandardized = hybridBUnstan,
+  hybridBMatrixSep = hybridBList,
+  lavaanObject = hybridModel,
+  glmObject = glmModel
+)
+
+save(
+  hybridModelList,
+  file = paste0(
+    "04_output/hybridModelList_",
+    Sys.Date(),
+    ".RData"
+  )
+)
+```
+
+# Bootstrap the CLPN for in- and out-prediction
+bootstrapPredictionMetrics() bootstraps the data and calculates prediction metrics from each of the bootstrapped datasets
+```{r bootstrap}
+# Bootstrap prediction metrics (from prior chunk above)
+set.seed(123456)
+predictionBootstrapDF <- bootstrapPredictionMetrics(
+  model = hybridModel,
+  designMat = designMat,
+  groups = groups,
+  samples = 500,
+  parallel = "multicore"
+)
+
+predictionBootstrapDF
+
+# Calculate stability intervals
+bootPredSummaryStat <- predictionBootstrapDF %>%
+  group_by(PredictionIndex, Variable) %>%
+  summarise(
+    mu = mean(PredictionValue),
+    s = sd(PredictionValue),
+    max = max(PredictionValue),
+    min = min(PredictionValue)
+  )
+
+bootPredSummaryStat
+
+# Save bootstrap results
+saveRDS(
+  predictionBootstrapDF,
+  file = paste0(
+    "04_output/predictionBootstrapDF_",
+    Sys.Date(),
+    ".rds"
+  )
+)
+
+save(
+  predictionBootstrapDF,
+  file = paste0(
+    "04_output/predictionBootstrapDF_",
+    Sys.Date(),
+    ".RData"
+  )
+)
+
+predictionBootstrapDF
+```
+
+# Visualize stability
+```{r bootstrap vis}
+inPred <- bootPredSummaryStat %>%
+  filter(PredictionIndex %in% c("InPred", "CrossLagInPred")) %>%
+  mutate(
+    Variable = gsub("^TP[12]_RESST_", "R", Variable)
+  )
+
+outPred <- bootPredSummaryStat %>%
+  filter(PredictionIndex %in% c("OutPred", "CrossLagOutPred")) %>%
+  mutate(
+    Variable = gsub("^TP[12]_RESST_", "R", Variable)
+  ) 
+
+# Set order of variables 
+inPred <- inPred %>%
+  mutate(Variable = factor(Variable, levels = paste0("R", 1:21)))
+
+outPred <- outPred %>%
+  mutate(Variable = factor(Variable, levels = paste0("R", 1:21)))
+
+# In-prediction plot
+inpredict <- ggplot(inPred, aes(x = Variable, y = mu, fill = PredictionIndex)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = mu - s, ymax = mu + s), width = 0.2, position = position_dodge(0.9)) +
+  labs(
+    y = "In-Prediction",
+    x = "",
+    title = "Cross-Lagged In-Prediction of Variables"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Out-prediction plot
+outpredict <- ggplot(outPred, aes(x = Variable, y = mu, fill = PredictionIndex)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = mu - s, ymax = mu + s), width = 0.2, position = position_dodge(0.9)) +
+  labs(
+    y = "Out-Prediction",
+    x = "",
+    title = "Cross-Lagged Out-Prediction of Variables"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save 
+# In-prediction plot
+ggsave(
+  filename = paste0("04_output/InPrediction_", Sys.Date(), ".png"
+  ),
+  plot = inpredict,
+  width = 10,
+  height = 6
+)
+
+# Out-prediction plot
+ggsave(
+  filename = paste0(
+    "04_output/OutPrediction_", Sys.Date(), ".png"
+  ),
+  plot = outpredict,
+  width = 10,
+  height = 6
+)
+```
+
